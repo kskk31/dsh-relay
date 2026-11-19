@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "带话",
+    "description": "让 QQ 会话之间交接一句话：甲托 A 带话给乙时，话交给乙自己的会话去说，乙看到的是「甲说，……」。",
+    "detail": "docs/DETAIL.md"
+  }
+}
