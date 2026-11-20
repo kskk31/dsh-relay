@@ -4,10 +4,12 @@
  * 场景：甲和「负责甲的会话 A」说话，想让 A 带话给乙。乙的回复只会落到「负责乙的会话 B」，
  * A/B 互不相通，于是 B 不知道前因、开始乱发消息。
  *
- * 做法：A 不直接给乙发消息，而是调用 `qq_relay` 把话交给 B——插件把一段带前因的消息
- * 投进 B 的待处理上下文，由 B 用自己的口吻发给乙（乙看到的是「甲说，……」）。
- * 关键词（`转告`、`帮我跟他说` …）出现在甲对 A 说的话里时，才认为 A 获得了这次带话的授权，
- * 防止 A 自作主张；投递后若 B 整轮都没发出去，插件兜底代发同一句。
+ * 做法有两层：
+ * 1）自动同步（默认，不依赖模型自觉）：A 用 qq_send_text 等工具把消息发给「不是当前聊天对象」
+ *    的人时，插件把这条消息的背景塞进对方会话 B 的待处理上下文（`agent.inject`，不唤醒）。
+ *    这样 B 在乙回话时就知道前因，不会瞎发。
+ * 2）显式交接：A 调用 `qq_relay`，插件把话交给 B，由 B 用自己的口吻发给乙（乙看到「甲说，……」）。
+ *    关键词（`转告`、`帮我跟他说` …）出现在甲对 A 说的话里时才授权；B 整轮没发就兜底代发。
  *
  * 开关：`config.enabled`（默认开）。关掉时不注册任何工具与监听器。
  */
@@ -51,6 +53,8 @@ export function apply(ctx, config) {
   const armed = new Map()
   /** 目标会话 id → 正在等它发出去的那次交接。 */
   const pending = new Map()
+  /** 已经同步过背景的跨会话发送（按 callId 去重，防重试重复注入）。 */
+  const shared = new Set()
 
   const isArmed = (sessionId) => {
     const at = armed.get(sessionId)
@@ -196,6 +200,17 @@ export function apply(ctx, config) {
     pending.clear()
   })
 
+  // 真正的兜底：A 把消息发给「不是当前聊天对象」的人时，把背景同步进对方会话。
+  // 用 tools/result（发送成功之后）而不是 pre-execute，避免消息没发出去却留下了背景。
+  const offResult = ctx.on('tools/result', (exec, result) => {
+    void shareCrossTalk(exec, result).catch((error) => {
+      note(ctx, 'warn', `同步跨会话背景出错：${error instanceof Error ? error.message : String(error)}`)
+    })
+  })
+  ctx.on('dispose', () => {
+    offResult()
+  })
+
   function handleEvent(session, event) {
     const sessionId = safeString(session?.id)
     if (!sessionId || !isQqSession(sessionId)) return
@@ -264,6 +279,53 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * A 把消息发给了「别人」：把这条消息的背景塞进对方会话，让那边的 agent 知道前因。
+   * 只做「记背景」，不改发出去的内容、不唤醒对方、不替谁说话。
+   */
+  async function shareCrossTalk(exec, result) {
+    if (result?.isError) return
+    if (!SEND_TOOLS.has(safeString(exec?.name))) return
+    const sessionId = safeString(exec?.agent?.id)
+    if (!isQqSession(sessionId)) return
+
+    const info = sendTargetOf(safeString(exec?.name), exec?.arguments)
+    if (!info) return
+
+    const senderBase = stripGeneration(sessionId)
+    const targetBase = roomOf(info, settings)
+    if (targetBase === senderBase) return
+
+    const key = safeString(exec?.callId) || `${senderBase}->${targetBase}:${info.target}`
+    if (shared.has(key)) return
+    shared.add(key)
+    if (shared.size > 500) shared.clear()
+
+    const signal = new AbortController().signal
+    const list = await ctx.sessionController.list({}, signal)
+    const target = pickLatest(list?.items, targetBase)
+    if (!target) {
+      note(ctx, 'warn', `${targetBase} 还没有会话，这条跨会话消息的背景没地方放。`)
+      return
+    }
+    const resolved = await ctx.sessionController.resolveAgent(target.sessionId)
+    const targetAgent = resolved?.agent
+    if (!targetAgent) {
+      note(ctx, 'warn', `打不开 ${target.sessionId}（${safeString(resolved?.error) || '未知原因'}），背景没同步。`)
+      return
+    }
+
+    const fromLabel = (await fromLabelOf(ctx, sessionId)) || '对方'
+    const body = buildShareText({
+      fromLabel,
+      isGroup: info.isGroup,
+      to: info.target,
+      text: info.text,
+    })
+    targetAgent.inject(relayMessage(body))
+    note(ctx, 'info', `跨会话背景已同步：${sessionId} → ${target.sessionId}（${info.target}）`)
+  }
+
   note(ctx, 'info', `已启用（关键词：${settings.keywords.join('、')}；授权 ${Math.round(settings.armTtlMs / 60000)} 分钟）。`)
 }
 
@@ -290,6 +352,74 @@ function isQqSession(sessionId) {
   return typeof sessionId === 'string' && sessionId.startsWith('qq-')
 }
 
+/** 去掉换血代际后缀：`qq-dm-123-r2` → `qq-dm-123`。 */
+function stripGeneration(sessionId) {
+  return safeString(sessionId).replace(/-r\d+$/, '')
+}
+
+/** 会话 id → 这次发送应当落在哪个「房间」。 */
+function roomOf(info, settings) {
+  if (info.isGroup) return settings.hubSessionId
+  if (settings.vipIds.includes(info.target)) return settings.vipSessionId
+  return `qq-dm-${info.target}`
+}
+
+/** 从发送工具的已解析参数里取出「发给谁、发了什么」。 */
+function sendTargetOf(name, args) {
+  const parsed = typeof args === 'string' ? tryJson(args) : args
+  if (!parsed || typeof parsed !== 'object') return null
+  const target = Number(parsed.target ?? parsed.groupId ?? parsed.userId)
+  if (!Number.isInteger(target) || target <= 0) return null
+  const file = safeString(parsed.file)
+  const raw = safeString(parsed.text).trim()
+    || safeString(parsed.name).trim()
+    || safeString(parsed.url).trim()
+    || (file ? `（发了一个文件：${file.split(/[\\/]/).pop() || file}）` : '')
+    || '（发的不是文字，是图片/语音/表情）'
+  return {
+    tool: name,
+    isGroup: parsed.isGroup === true,
+    target,
+    text: raw.length > 600 ? `${raw.slice(0, 600)}…` : raw,
+  }
+}
+
+/** 给目标会话 agent 看的背景说明：只告知，不要求它做任何事。 */
+function buildShareText({ fromLabel, isGroup, to, text }) {
+  const where = isGroup ? `群 ${to}` : `QQ ${to}`
+  const them = isGroup ? '群里' : 'ta'
+  return [
+    `【带话 · 自动同步 · 来自「${fromLabel}」】`,
+    '',
+    `「${fromLabel}」那边刚才给 ${where} 发了一句话，原样是：`,
+    `> ${text}`,
+    '',
+    `这句话已经直接发到 ${them} 的窗口了，你不用再发一遍；${them} 之后回你时，知道它是「${fromLabel}」那边托人带过来的就行。`,
+  ].join('\n')
+}
+
+async function fromLabelOf(ctx, sessionId) {
+  const title = safeString(await sessionLabel(ctx, sessionId)).trim()
+  return title
+}
+
+/** 在会话列表里找某个房间最新（含代际）的那条。 */
+function pickLatest(items, base) {
+  const pattern = new RegExp(`^${escapeRegExp(base)}(-r\\d+)?$`)
+  let best = null
+  let bestAt = Number.NEGATIVE_INFINITY
+  for (const item of items ?? []) {
+    const sessionId = safeString(item?.sessionId)
+    if (!pattern.test(sessionId)) continue
+    const at = Date.parse(safeString(item?.updatedAt)) || 0
+    if (at > bestAt) {
+      best = item
+      bestAt = at
+    }
+  }
+  return best
+}
+
 /** 读会话标题；没有就退回会话 id 里的 QQ 号。 */
 async function sessionLabel(ctx, sessionId) {
   try {
@@ -306,20 +436,8 @@ async function sessionLabel(ctx, sessionId) {
 
 /** 找目标联系人最近的会话（含 `-rN` 换血代际）。 */
 async function findSession(ctx, base, signal) {
-  const pattern = new RegExp(`^${escapeRegExp(base)}(-r\\d+)?$`)
   const list = await ctx.sessionController.list({}, signal ?? new AbortController().signal)
-  let best = null
-  let bestAt = Number.NEGATIVE_INFINITY
-  for (const item of list?.items ?? []) {
-    const sessionId = safeString(item?.sessionId)
-    if (!pattern.test(sessionId)) continue
-    const at = Date.parse(safeString(item?.updatedAt)) || 0
-    if (at > bestAt) {
-      best = item
-      bestAt = at
-    }
-  }
-  return best
+  return pickLatest(list?.items, base)
 }
 
 function buildRelayBody({ fromName, to, isGroup, text, noteText, sendText }) {
@@ -342,7 +460,7 @@ function buildRelayBody({ fromName, to, isGroup, text, noteText, sendText }) {
 
 function relayMessage(text) {
   return {
-    id: `relay_${randomUUID()}`,
+    id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
     source: { kind: 'user', plugin: 'session-relay' },
@@ -365,6 +483,14 @@ function safeString(value) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function tryJson(text) {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
 }
 
 function note(ctx, level, text) {
