@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Relay",
-    "description": "Shares context between QQ conversations: when an agent messages someone outside its own chat, the background is injected into that person's conversation; qq_relay also hands a message over so the right agent says it in its own voice.",
+    "description": "Shares context between QQ conversations: when an agent messages someone outside its own chat, the background is injected into that person's conversation, and the reply is carried back; qq_relay also hands a message over so the right agent says it in its own voice.",
     "detail": "docs/DETAIL.md"
   }
 }

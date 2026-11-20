@@ -40,6 +40,9 @@ const ARM_TTL_MS = 10 * 60 * 1000
 /** 交接后等 B 发消息的上限；超时就放弃兜底，免得半夜突然发一句。 */
 const RELAY_WAIT_MS = 10 * 60 * 1000
 
+/** A 往乙那边发过一次消息之后，等乙回话、再把回话带回 A 的时限。 */
+const REPLY_WINDOW_MS = 30 * 60 * 1000
+
 export const inject = ['tools', 'sessionController']
 
 export function apply(ctx, config) {
@@ -55,6 +58,8 @@ export function apply(ctx, config) {
   const pending = new Map()
   /** 已经同步过背景的跨会话发送（按 callId 去重，防重试重复注入）。 */
   const shared = new Set()
+  /** 乙的会话 id → 正在等乙回话、好把回话带回甲的那次发送。 */
+  const replyExpectations = new Map()
 
   const isArmed = (sessionId) => {
     const at = armed.get(sessionId)
@@ -87,8 +92,8 @@ export function apply(ctx, config) {
     }
     if (!isArmed(fromSessionId)) {
       throw new Error(
-        '甲刚才没有说要你带话，别自己决定。先用一句话问清楚要带给谁、说什么；'
-        + '甲明确说「转告…」「帮我跟他说…」这类话之后，再调用 qq_relay。',
+        '对方刚才没有明确说要你带话，别自己决定。先用一句话问清楚要带给谁、说什么；'
+        + '对方明确说「转告…」「帮我跟他说…」这类话之后，再调用 qq_relay。',
       )
     }
 
@@ -139,6 +144,15 @@ export function apply(ctx, config) {
     record.timer.unref?.()
     pending.set(target.sessionId, record)
 
+    rememberReplyExpectation(replyExpectations, {
+      fromSessionId,
+      toSessionId: target.sessionId,
+      isGroup,
+      peerQQ: to,
+    })
+    // B 也可能要把乙的话带回去：给它一次授权，免得被关键词卡住。
+    armed.set(target.sessionId, Date.now())
+
     note(ctx, 'info', `已把「${fromName}」的话交接给 ${target.sessionId}（目标 ${to}，群=${isGroup}）。`)
     return { ok: true, sessionId: target.sessionId, target: to }
   }
@@ -146,18 +160,18 @@ export function apply(ctx, config) {
   const definition = {
     name: 'qq_relay',
     description: [
-      '把甲要带的话交接给「对方」自己的 QQ 会话，由那边的会话去发，而不是你直接发。',
-      '只有甲明确让你带话（说「转告」「帮我跟他说」「带个话」之类）时才用；甲没说就先问清楚。',
-      '交接成功后对方会用自己的口吻发给乙。你只要回甲一句「带到了」，不要再用 qq_send_text 发同一句。',
+      '把一句话交接给「另一个人」的 QQ 会话，由那边的会话用自己的口吻去说，而不是你直接发。两个方向都适用。',
+      '只在当前聊天的人明确让你带话（说「转告」「帮我跟他说」「带个话」之类）时才用；没说就先问清楚要带给谁、说什么。',
+      '交接成功后对方会自己发出去。你只要回一句「带到了」，不要再用 qq_send_text 发同一句。',
     ].join(''),
     parameters: {
       type: 'object',
       properties: {
         to: { type: 'integer', description: '要带给谁：私聊填 QQ 号，群聊填群号。' },
-        text: { type: 'string', description: '甲要带给对方的那句话，原样放进来，不要改写。' },
+        text: { type: 'string', description: '要带给对方的那句话，原样放进来，不要改写。' },
         isGroup: { type: 'boolean', description: 'true=带给一个群；false 或不填=私聊某个 QQ。', default: false },
         from: { type: 'string', description: '可选：托你带话的人叫什么（聊天里看到的昵称）；不填就用会话标题。' },
-        note: { type: 'string', description: '可选：甲的原话或补充语境，帮对方理解前因。' },
+        note: { type: 'string', description: '可选：原话或补充语境，帮对方理解前因。' },
       },
       required: ['to', 'text'],
       additionalProperties: false,
@@ -198,6 +212,7 @@ export function apply(ctx, config) {
     offEvent()
     for (const record of pending.values()) clearTimeout(record.timer)
     pending.clear()
+    replyExpectations.clear()
   })
 
   // 真正的兜底：A 把消息发给「不是当前聊天对象」的人时，把背景同步进对方会话。
@@ -223,6 +238,9 @@ export function apply(ctx, config) {
         if (settings.keywords.some((keyword) => text.includes(keyword))) {
           armed.set(sessionId, Date.now())
         }
+        void settleReplyExpectation(ctx, replyExpectations, sessionId, text, settings).catch((error) => {
+          note(ctx, 'warn', `把回话带回原会话出错：${error instanceof Error ? error.message : String(error)}`)
+        })
         return
       }
       case 'tool/call': {
@@ -321,8 +339,17 @@ export function apply(ctx, config) {
       isGroup: info.isGroup,
       to: info.target,
       text: info.text,
+      ownerQQ: qqNumberOf(senderBase),
     })
     targetAgent.inject(relayMessage(body))
+    rememberReplyExpectation(replyExpectations, {
+      fromSessionId: sessionId,
+      toSessionId: target.sessionId,
+      isGroup: info.isGroup,
+      peerQQ: info.target,
+    })
+    // 让 B 也能把乙的话带回甲（否则它没有带话授权，只能干看着）。
+    armed.set(target.sessionId, Date.now())
     note(ctx, 'info', `跨会话背景已同步：${sessionId} → ${target.sessionId}（${info.target}）`)
   }
 
@@ -385,17 +412,93 @@ function sendTargetOf(name, args) {
 }
 
 /** 给目标会话 agent 看的背景说明：只告知，不要求它做任何事。 */
-function buildShareText({ fromLabel, isGroup, to, text }) {
+function buildShareText({ fromLabel, isGroup, to, text, ownerQQ }) {
   const where = isGroup ? `群 ${to}` : `QQ ${to}`
   const them = isGroup ? '群里' : 'ta'
-  return [
+  const lines = [
     `【带话 · 自动同步 · 来自「${fromLabel}」】`,
     '',
     `「${fromLabel}」那边刚才给 ${where} 发了一句话，原样是：`,
     `> ${text}`,
     '',
     `这句话已经直接发到 ${them} 的窗口了，你不用再发一遍；${them} 之后回你时，知道它是「${fromLabel}」那边托人带过来的就行。`,
+  ]
+  if (ownerQQ > 0) {
+    lines.push(
+      '',
+      `「${fromLabel}」是 QQ ${ownerQQ}。如果之后要把对方的话带回给他，用 \`qq_relay({ to: ${ownerQQ}, text: "…" })\` 交接给他的会话，不要自己直接发。`,
+    )
+  }
+  return lines.join('\n')
+}
+
+/** 记下「等乙回话」：A 往乙那边发过消息，乙的下一条消息要带回 A。 */
+function rememberReplyExpectation(expectations, { fromSessionId, toSessionId, isGroup, peerQQ }) {
+  if (isGroup) return
+  const fromBase = stripGeneration(fromSessionId)
+  const toBase = stripGeneration(toSessionId)
+  expectations.set(toBase, {
+    fromBase,
+    ownerQQ: qqNumberOf(fromBase),
+    peerQQ,
+    expiresAt: Date.now() + REPLY_WINDOW_MS,
+    used: false,
+  })
+}
+
+/** 乙真的回话了：把这条回话带回 A，由 A 决定要不要转告甲。 */
+async function settleReplyExpectation(ctx, expectations, sessionId, text, settings) {
+  const key = stripGeneration(sessionId)
+  const expect = expectations.get(key)
+  if (!expect || expect.used) return
+  if (Date.now() > expect.expiresAt) {
+    expectations.delete(key)
+    return
+  }
+  expect.used = true
+
+  const source = await findSession(ctx, expect.fromBase)
+  if (!source) {
+    note(ctx, 'warn', `乙回话了，但找不到原会话 ${expect.fromBase}，回话没带回去。`)
+    return
+  }
+  const resolved = await ctx.sessionController.resolveAgent(source.sessionId)
+  const sourceAgent = resolved?.agent
+  if (!sourceAgent) {
+    note(ctx, 'warn', `乙回话了，但打不开原会话 ${source.sessionId}。`)
+    return
+  }
+
+  const peerLabel = (await sessionLabel(ctx, sessionId)) || `QQ ${expect.peerQQ}`
+  const body = buildReplyText({
+    peerLabel,
+    peerQQ: expect.peerQQ,
+    ownerQQ: expect.ownerQQ,
+    text,
+  })
+  sourceAgent.followup(relayMessage(body))
+  note(ctx, 'info', `乙的回话已带回 ${source.sessionId}（对方 QQ ${expect.peerQQ}）。`)
+}
+
+function buildReplyText({ peerLabel, peerQQ, ownerQQ, text }) {
+  const cut = text.length > 600 ? `${text.slice(0, 600)}…` : text
+  const howToSend = ownerQQ > 0
+    ? `如果这是给甲的答复，请用 qq_send_text 转告甲（isGroup: false, target: ${ownerQQ}，文字就写「${peerLabel}说，${cut}」）。`
+    : '如果这是给甲的答复，用你平时回甲的方式转告他。'
+  return [
+    `【回话 · 来自「${peerLabel}」的会话】`,
+    '',
+    `${peerLabel} 刚才回了：`,
+    `> ${cut}`,
+    '',
+    `${howToSend}转告完就行，不用再回这边。`,
   ].join('\n')
+}
+
+/** `qq-dm-2174007116` → 2174007116；其他房间（vip/hub/群）拿不到就算 0。 */
+function qqNumberOf(base) {
+  const matched = /^qq-dm-(\d+)$/.exec(safeString(base))
+  return matched ? Number(matched[1]) : 0
 }
 
 async function fromLabelOf(ctx, sessionId) {
