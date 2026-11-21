@@ -45,6 +45,9 @@ const REPLY_WINDOW_MS = 30 * 60 * 1000
 
 export const inject = ['tools', 'sessionController']
 
+/** 插件版本；自检工具会报出来，方便确认真机上跑的是哪一版。 */
+const VERSION = '1.3.0'
+
 export function apply(ctx, config) {
   const settings = normalizeConfig(config)
   if (!settings.enabled) {
@@ -60,6 +63,12 @@ export function apply(ctx, config) {
   const shared = new Set()
   /** 乙的会话 id → 正在等乙回话、好把回话带回甲的那次发送。 */
   const replyExpectations = new Map()
+  /** 房间 → 这个房间最后一条真实入站消息（从 channel-qq 的合成文本里解出来的）。 */
+  const lastInbound = new Map()
+  /** 会话 id → 有人托这个会话给「别人」带了话，等它这边回一句、好把回话带回去。 */
+  const replyBacks = new Map()
+  /** 自检计数：确认监听器在这套 Host 里真的收到事件。 */
+  const counters = { sessionEvents: 0, userMessages: 0, turnEnds: 0, toolResults: 0, relayCalls: 0 }
 
   const isArmed = (sessionId) => {
     const at = armed.get(sessionId)
@@ -72,6 +81,7 @@ export function apply(ctx, config) {
   }
 
   async function relay(args, exec) {
+    counters.relayCalls += 1
     const input = args ?? {}
     const to = Number(input.to)
     const text = safeString(input.text).trim()
@@ -197,11 +207,35 @@ export function apply(ctx, config) {
   const disposeTool = ctx.tools.register(definition, {
     when: ({ agent }) => isQqSession(safeString(agent?.id)),
   })
+
+  const disposeStatus = ctx.tools.register({
+    name: 'qq_relay_status',
+    description: '带话插件的自检：返回版本号和内部计数。怀疑「没反应」时先调它看监听器有没有收到事件。',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(_args, value) {
+        return [{ type: 'text', text: JSON.stringify(value) }]
+      },
+    },
+    execute: async () => ({
+      version: VERSION,
+      ...counters,
+      armed: armed.size,
+      pending: pending.size,
+      replyExpectations: replyExpectations.size,
+      replyBacks: replyBacks.size,
+      lastInbound: lastInbound.size,
+    }),
+  })
+
   ctx.on('dispose', () => {
     disposeTool()
+    disposeStatus()
   })
 
   const offEvent = ctx.on('session/event', (session, event) => {
+    counters.sessionEvents += 1
     try {
       handleEvent(session, event)
     } catch (error) {
@@ -213,11 +247,14 @@ export function apply(ctx, config) {
     for (const record of pending.values()) clearTimeout(record.timer)
     pending.clear()
     replyExpectations.clear()
+    replyBacks.clear()
+    lastInbound.clear()
   })
 
   // 真正的兜底：A 把消息发给「不是当前聊天对象」的人时，把背景同步进对方会话。
   // 用 tools/result（发送成功之后）而不是 pre-execute，避免消息没发出去却留下了背景。
   const offResult = ctx.on('tools/result', (exec, result) => {
+    counters.toolResults += 1
     void shareCrossTalk(exec, result).catch((error) => {
       note(ctx, 'warn', `同步跨会话背景出错：${error instanceof Error ? error.message : String(error)}`)
     })
@@ -229,14 +266,26 @@ export function apply(ctx, config) {
   function handleEvent(session, event) {
     const sessionId = safeString(session?.id)
     if (!sessionId || !isQqSession(sessionId)) return
+    const base = stripGeneration(sessionId)
     switch (event?.type) {
       case 'user/message': {
+        counters.userMessages += 1
         const message = event.message
         if (message?.source?.plugin === 'session-relay') return
-        const text = textOfMessage(message)
-        if (!text) return
+        const raw = textOfMessage(message)
+        if (!raw) return
+        const inbound = message?.source?.plugin === 'channel-qq' ? parseInbound(raw) : null
+        if (inbound) lastInbound.set(base, { ...inbound, at: Date.now() })
+        const text = inbound?.body || raw
         if (settings.keywords.some((keyword) => text.includes(keyword))) {
           armed.set(sessionId, Date.now())
+        }
+        const back = replyBacks.get(base)
+        if (back && !back.used && inbound) {
+          back.userText = text
+          back.userAt = Date.now()
+          // 不管这一轮什么时候开始的，都算「这句话这一轮」——这一轮结束时带回。
+          back.turn = null
         }
         void settleReplyExpectation(ctx, replyExpectations, sessionId, text, settings).catch((error) => {
           note(ctx, 'warn', `把回话带回原会话出错：${error instanceof Error ? error.message : String(error)}`)
@@ -244,6 +293,8 @@ export function apply(ctx, config) {
         return
       }
       case 'tool/call': {
+        const back = replyBacks.get(base)
+        if (back && safeString(event.name) === 'qq_relay') back.sawRelay = true
         const record = pending.get(sessionId)
         if (!record || record.sawSend || !SEND_TOOLS.has(safeString(event.name))) return
         let parsed = null
@@ -256,12 +307,28 @@ export function apply(ctx, config) {
         return
       }
       case 'turn/start': {
+        const back = replyBacks.get(base)
+        if (back && back.turn === null) back.turn = Number(event.turn)
         const record = pending.get(sessionId)
         if (!record || record.startedTurn !== null) return
         if (Number(event.turn) >= 0) record.startedTurn = Number(event.turn)
         return
       }
       case 'turn/end': {
+        counters.turnEnds += 1
+        const back = replyBacks.get(base)
+        if (back && Date.now() > back.expiresAt) replyBacks.delete(base)
+        if (back && !back.used && back.userText && Date.now() < back.expiresAt
+          && (back.turn === null || Number(event.turn) === back.turn)) {
+          replyBacks.delete(base)
+          if (!back.sawRelay) {
+            void deliverReplyBack(back).catch((error) => {
+              note(ctx, 'warn', `把这边的话带回对方出错：${error instanceof Error ? error.message : String(error)}`)
+            })
+          } else {
+            note(ctx, 'info', `${sessionId} 这一轮自己用了 qq_relay，跳过自动带回。`)
+          }
+        }
         const record = pending.get(sessionId)
         if (!record) return
         if (record.startedTurn === null || Number(event.turn) !== record.startedTurn) return
@@ -272,6 +339,34 @@ export function apply(ctx, config) {
       }
       default:
     }
+  }
+
+  /**
+   * 有人托这个会话给「别人」带了话（背景已经注入），这边回一句时把这句话带回对方的会话。
+   * 只带这条真实入站消息的原文，不替谁转述。
+   */
+  async function deliverReplyBack(back) {
+    const peer = await findSession(ctx, back.peerBase)
+    if (!peer) {
+      note(ctx, 'warn', `回话要带回 ${back.peerBase}，但那个会话已经不在了。`)
+      return
+    }
+    const resolved = await ctx.sessionController.resolveAgent(peer.sessionId)
+    const peerAgent = resolved?.agent
+    if (!peerAgent) {
+      note(ctx, 'warn', `回话要带回 ${peer.sessionId}，但打不开（${safeString(resolved?.error) || '未知原因'}）。`)
+      return
+    }
+    const originLabel = (await sessionLabel(ctx, back.originBase)) || '对方'
+    const peerLabel = (await sessionLabel(ctx, peer.sessionId)) || back.peerLabel || '对方'
+    peerAgent.followup(relayMessage(buildAutoReplyText({
+      originLabel,
+      peerLabel,
+      peerQQ: back.peerQQ,
+      text: back.userText,
+    })))
+    armed.set(peer.sessionId, Date.now())
+    note(ctx, 'info', `已经把这边的回话自动带回 ${peer.sessionId}（给 ${back.peerQQ}）。`)
   }
 
   async function sendFallback(record) {
@@ -333,23 +428,35 @@ export function apply(ctx, config) {
       return
     }
 
-    const fromLabel = (await fromLabelOf(ctx, sessionId)) || '对方'
+    const peer = lastInbound.get(senderBase)
+    const fromLabel = peer?.nick || (await fromLabelOf(ctx, sessionId)) || '对方'
+    const ownerQQ = qqNumberOf(senderBase) || peer?.qq || 0
     const body = buildShareText({
       fromLabel,
       isGroup: info.isGroup,
       to: info.target,
       text: info.text,
-      ownerQQ: qqNumberOf(senderBase),
+      ownerQQ,
     })
     targetAgent.inject(relayMessage(body))
-    rememberReplyExpectation(replyExpectations, {
-      fromSessionId: sessionId,
-      toSessionId: target.sessionId,
-      isGroup: info.isGroup,
-      peerQQ: info.target,
-    })
     // 让 B 也能把乙的话带回甲（否则它没有带话授权，只能干看着）。
     armed.set(target.sessionId, Date.now())
+    // 有人托这个会话给「别人」带了话：对方回一句时，把这边的话带回对方。
+    if (!info.isGroup) {
+      replyBacks.set(stripGeneration(target.sessionId), {
+        peerBase: senderBase,
+        originBase: stripGeneration(target.sessionId),
+        peerQQ: peer?.qq || 0,
+        peerLabel: peer?.nick || '',
+        askedText: info.text,
+        userText: null,
+        userAt: 0,
+        turn: null,
+        used: false,
+        sawRelay: false,
+        expiresAt: Date.now() + REPLY_WINDOW_MS,
+      })
+    }
     note(ctx, 'info', `跨会话背景已同步：${sessionId} → ${target.sessionId}（${info.target}）`)
   }
 
@@ -391,6 +498,29 @@ function roomOf(info, settings) {
   return `qq-dm-${info.target}`
 }
 
+/** 从 channel-qq 那块合成文本里解出「谁、说了什么」。解不出来就返回 null。 */
+function parseInbound(text) {
+  const raw = safeString(text)
+  if (!raw.includes('[私聊]') && !raw.includes('[群')) return null
+  const dm = /\[私聊\][^\n]*?\((\d{5,12})\)[^\n]*?：([\s\S]*)/.exec(raw)
+  if (dm) {
+    const nick = (/(?:^|\s)(\S+?)\(\d{5,12}\)/.exec(dm[0]) || [])[1] || ''
+    return { isGroup: false, qq: Number(dm[1]), nick, body: cutInboundBody(dm[2]) }
+  }
+  const group = /\[群(\d{5,12})\][^\n]*?\((\d{5,12})\)[^\n]*?：([\s\S]*)/.exec(raw)
+  if (group) {
+    const nick = (/(?:^|\s)(\S+?)\(\d{5,12}\)/.exec(group[0]) || [])[1] || ''
+    return { isGroup: true, groupQQ: Number(group[1]), qq: Number(group[2]), nick, body: cutInboundBody(group[3]) }
+  }
+  return null
+}
+
+/** 切掉入站文本后面紧跟的 `[知识库…]`、`【这是私聊】` 这些夹带说明。 */
+function cutInboundBody(text) {
+  const cut = text.search(/\n(?=\[|【)/)
+  return (cut >= 0 ? text.slice(0, cut) : text).trim()
+}
+
 /** 从发送工具的已解析参数里取出「发给谁、发了什么」。 */
 function sendTargetOf(name, args) {
   const parsed = typeof args === 'string' ? tryJson(args) : args
@@ -426,10 +556,26 @@ function buildShareText({ fromLabel, isGroup, to, text, ownerQQ }) {
   if (ownerQQ > 0) {
     lines.push(
       '',
-      `「${fromLabel}」是 QQ ${ownerQQ}。如果之后要把对方的话带回给他，用 \`qq_relay({ to: ${ownerQQ}, text: "…" })\` 交接给他的会话，不要自己直接发。`,
+      `「${fromLabel}」是 QQ ${ownerQQ}。这边的人如果回了一句、而这句话是要给「${fromLabel}」的答复，就用 \`qq_relay({ to: ${ownerQQ}, text: "…" })\` 交接给「${fromLabel}」的会话，不要自己直接发。`,
     )
   }
   return lines.join('\n')
+}
+
+/** 「有人托这边的会话给「别人」带了话」→ 这边回话时，把它带回对方的会话。 */
+function buildAutoReplyText({ originLabel, peerLabel, peerQQ, text }) {
+  const cut = text.length > 600 ? `${text.slice(0, 600)}…` : text
+  const howToSend = peerQQ > 0
+    ? `如果「${peerLabel}」还在等答复，请用 qq_send_text 发给 ta（isGroup: false, target: ${peerQQ}，文字写「${originLabel}说，${cut}」）。`
+    : `如果「${peerLabel}」还在等答复，用你平时回 ta 的方式转告。`
+  return [
+    `【回话 · 自动带回 · 来自「${originLabel}」的会话】`,
+    '',
+    `${originLabel} 刚才回了一句：`,
+    `> ${cut}`,
+    '',
+    `这是在回答「${peerLabel}」先前托人问的那件事。${howToSend}发完不用再回这边。`,
+  ].join('\n')
 }
 
 /** 记下「等乙回话」：A 往乙那边发过消息，乙的下一条消息要带回 A。 */
